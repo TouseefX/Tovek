@@ -14,8 +14,8 @@
 
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JObject, JValue};
+use winit::platform::android::activity::{AndroidApp, WindowManagerFlags};
 
-const FLAG_KEEP_SCREEN_ON: i32 = 0x0000_0080;
 const PARTIAL_WAKE_LOCK: i32 = 0x0000_0001;
 
 /// Run `f` with an attached JNI env + the NativeActivity object.
@@ -29,24 +29,48 @@ fn with_activity<T>(
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let activity = unsafe { JObject::from_raw(ctx.context() as jni::sys::jobject) };
     let result = f(&mut env, &activity);
-    // A pending Java exception would abort the process on the next JNI call:
-    // clear it and surface the error as a string instead.
-    if env.exception_check().unwrap_or(false) {
-        let _ = env.exception_clear();
-    }
-    result.map_err(|e| e.to_string())
+    result.map_err(|err| {
+        // A pending Java exception would abort the process on the next JNI
+        // call. Pull the throwable's toString() so the user sees the real
+        // reason (e.g. a SecurityException), not just "Java exception was
+        // thrown", then clear it.
+        let mut detail = None;
+        if env.exception_check().unwrap_or(false) {
+            let throwable = env.exception_occurred();
+            let _ = env.exception_clear();
+            if let Ok(throwable) = throwable {
+                detail = env
+                    .call_method(&throwable, "toString", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .and_then(|v| v.l().ok())
+                    .and_then(|s| {
+                        env.get_string(&jni::objects::JString::from(s))
+                            .ok()
+                            .map(String::from)
+                    });
+            }
+        }
+        match detail {
+            Some(detail) => format!("{err}: {detail}"),
+            None => err.to_string(),
+        }
+    })
 }
 
 /// Add or clear `FLAG_KEEP_SCREEN_ON` on the activity's window.
-pub fn keep_screen_on(on: bool) -> Result<(), String> {
-    with_activity(|env, activity| {
-        let window = env
-            .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
-            .l()?;
-        let method = if on { "addFlags" } else { "clearFlags" };
-        env.call_method(&window, method, "(I)V", &[JValue::Int(FLAG_KEEP_SCREEN_ON)])?;
-        Ok(())
-    })
+///
+/// Deliberately NOT done over JNI: `Window.addFlags` touches the view
+/// hierarchy, which only the Java UI thread may do — calling it from the
+/// native (android_main / render) thread throws
+/// `CalledFromWrongThreadException`. `AndroidApp::set_window_flags` goes
+/// through the NDK's `ANativeActivity_setWindowFlags`, which posts the change
+/// to the UI thread and is safe to call from any thread, at any time.
+pub fn keep_screen_on(app: &AndroidApp, on: bool) {
+    if on {
+        app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
+    } else {
+        app.set_window_flags(WindowManagerFlags::empty(), WindowManagerFlags::KEEP_SCREEN_ON);
+    }
 }
 
 /// A held `PowerManager.WakeLock`; released on [`WakeLock::release`] or drop.

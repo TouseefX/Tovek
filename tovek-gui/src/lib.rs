@@ -89,10 +89,8 @@ fn android_main(android_app: winit::platform::android::activity::AndroidApp) {
 
     // Keep the screen on from the start: the whole point of the app on a phone
     // is to sit in the foreground while the executor streams scripts to it.
-    // Best-effort — failure is logged, never fatal.
-    if let Err(error) = android::keep_screen_on(true) {
-        log::warn!("keep_screen_on failed: {error}");
-    }
+    // Goes through ANativeActivity_setWindowFlags (thread-safe, infallible).
+    android::keep_screen_on(&android_app, true);
 
     // Writable without any permission prompt; used as the default output /
     // browse location. External app dir first (user-visible under

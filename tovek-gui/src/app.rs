@@ -1000,8 +1000,8 @@ impl TovekApp {
                 .checkbox(&mut self.server.keep_screen_on, "Keep the screen on")
                 .changed()
             {
-                if let Err(error) = crate::android::keep_screen_on(self.server.keep_screen_on) {
-                    self.toast = Some(format!("keep screen on: {error}"));
+                if let Some(app) = &self.android_app {
+                    crate::android::keep_screen_on(app, self.server.keep_screen_on);
                 }
             }
             if ui
