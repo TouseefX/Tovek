@@ -21,8 +21,10 @@ on:
 permissions:
   contents: read
 
+# NOTE: no workflow-level `TOOLCHAIN` env — on Windows env vars are
+# case-insensitive and it would shadow the `toolchain` env dtolnay's action
+# sets for itself, breaking its input parsing.
 env:
-  TOOLCHAIN: nightly-2026-06-15
   # xbuild pinned for reproducible APK builds (master, 2025-08-15).
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
   NDK_VERSION: r27c
@@ -129,16 +131,16 @@ jobs:
           set -euo pipefail
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TOOLBIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           test -d "$SYSROOT/usr/lib/aarch64-linux-android/34"
           mkdir -p "$HOME/.cache/x"
           rm -rf "$HOME/.cache/x/Android.ndk"
           ln -s "$SYSROOT" "$HOME/.cache/x/Android.ndk"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          echo "$TOOLBIN" >> "$GITHUB_PATH"
 
-      - name: Install Rust ${{ env.TOOLCHAIN }} with the Android target
+      - name: Install Rust nightly with the Android target
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-15
