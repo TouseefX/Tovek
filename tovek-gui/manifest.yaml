@@ -30,12 +30,17 @@ android:
       # client that posts bytecode to it.
       - name: "android.permission.INTERNET"
       - name: "android.permission.ACCESS_NETWORK_STATE"
-      # Foreground/keep-alive support: the app holds a partial wake lock (and
-      # FLAG_KEEP_SCREEN_ON) while the server runs so an on-device executor can
-      # keep streaming scripts to it.
+      # Foreground/keep-alive support: TovekService (a real foreground service
+      # in its own :tovek_server process — injected into the APK by CI, since
+      # xbuild can't compile Java) runs the server, holds a partial wake lock +
+      # WiFi lock and shows a persistent notification, so the server survives
+      # the app being swiped away.
       - name: "android.permission.WAKE_LOCK"
       - name: "android.permission.FOREGROUND_SERVICE"
       - name: "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+      # API 33+: makes the keep-alive notification (and its Stop action)
+      # visible; the service runs either way.
+      - name: "android.permission.POST_NOTIFICATIONS"
       # Reading bytecode dumps from shared storage and writing decompiled
       # trees back. Legacy permissions for older devices, MANAGE_EXTERNAL_STORAGE
       # ("All files access", granted manually in system settings) for 30+.
@@ -47,6 +52,9 @@ android:
 
     application:
       label: "Tovek"
-      # Pure NativeActivity: no Java/Kotlin code in the APK.
-      # (xbuild appends android.app.lib_name + the MAIN/LAUNCHER intent filter
-      # to its default activity automatically.)
+      # xbuild emits a NativeActivity-only manifest (it appends
+      # android.app.lib_name + the MAIN/LAUNCHER intent filter to its default
+      # activity automatically). The keep-alive <service> declaration, the
+      # android:hasCode="true" flip and the classes.dex with TovekService are
+      # injected afterwards by CI (scripts/patch_android_manifest.py +
+      # javac/d8/apktool — see .github/workflows/gui.yaml).

@@ -251,6 +251,28 @@ fn count_outputs(out: &Path, extension: &str) -> usize {
 // Embedded server
 // ---------------------------------------------------------------------------
 
+/// Best-effort LAN address of this device — the address an executor on the
+/// same network must POST to when the server binds all interfaces. The UDP
+/// "connect" selects the outbound interface without sending a single packet.
+pub fn lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("8.8.8.8", 53)).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// True when something accepts TCP connections on 127.0.0.1:`port`. Used on
+/// Android, where the server lives in the `:tovek_server` service process and
+/// the UI can only observe it from the outside.
+pub fn probe_port(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250)).is_ok()
+}
+
 #[derive(Clone, Debug)]
 pub enum ServerEvent {
     Running(SocketAddr),

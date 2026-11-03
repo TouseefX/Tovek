@@ -273,12 +273,19 @@ struct ServerTab {
     bind_all: bool,
     handle: Option<jobs::ServerHandle>,
     state: ServerState,
-    #[cfg(target_os = "android")]
-    hold_wake_lock: bool,
-    #[cfg(target_os = "android")]
-    wake_lock: Option<crate::android::WakeLock>,
+    /// Cached LAN address for executor-facing URLs (refreshable in the UI).
+    lan_ip: Option<std::net::IpAddr>,
     #[cfg(target_os = "android")]
     keep_screen_on: bool,
+    /// Last time the UI probed 127.0.0.1:port for the service-hosted server.
+    #[cfg(target_os = "android")]
+    last_probe: Option<std::time::Instant>,
+    /// When the start intent was fired (grace period before declaring failure).
+    #[cfg(target_os = "android")]
+    started_at: Option<std::time::Instant>,
+    /// POST_NOTIFICATIONS has been requested once this session.
+    #[cfg(target_os = "android")]
+    notifications_requested: bool,
 }
 
 struct ScriptsTab {
@@ -355,15 +362,30 @@ impl TovekApp {
             },
             server: ServerTab {
                 port: 3000,
-                bind_all: false,
+                // Android: executors can only reach the phone's LAN address
+                // (http://<phone-ip>:<port>), never localhost — bind all
+                // interfaces by default. Desktop keeps loopback-only.
+                bind_all: cfg!(target_os = "android"),
                 handle: None,
+                // The Android server lives in the :tovek_server service
+                // process and survives UI restarts: adopt it if it's up.
+                #[cfg(target_os = "android")]
+                state: if jobs::probe_port(3000) {
+                    ServerState::Running(std::net::SocketAddr::from(([127, 0, 0, 1], 3000)))
+                } else {
+                    ServerState::Stopped
+                },
+                #[cfg(not(target_os = "android"))]
                 state: ServerState::Stopped,
-                #[cfg(target_os = "android")]
-                hold_wake_lock: true,
-                #[cfg(target_os = "android")]
-                wake_lock: None,
+                lan_ip: jobs::lan_ip(),
                 #[cfg(target_os = "android")]
                 keep_screen_on: true,
+                #[cfg(target_os = "android")]
+                last_probe: None,
+                #[cfg(target_os = "android")]
+                started_at: None,
+                #[cfg(target_os = "android")]
+                notifications_requested: false,
             },
             scripts: ScriptsTab {
                 show_single: false,
@@ -419,12 +441,15 @@ impl TovekApp {
     }
 
     fn save_client_scripts(&mut self, dir: &Path) {
-        let port = self.server.port;
+        let host = self.executor_host();
         let files = [
-            ("decompile.client.luau", scripts::single_client_for_port(port)),
+            (
+                "decompile.client.luau",
+                scripts::single_client_for_host(&host),
+            ),
             (
                 "decompile-batch.client.luau",
-                scripts::batch_client_for_port(port),
+                scripts::batch_client_for_host(&host),
             ),
         ];
         let mut saved = Vec::new();
@@ -497,7 +522,7 @@ impl TovekApp {
         }
 
         // Drain server events first (so the borrow of the handle ends), then
-        // apply them — applying can call &mut self helpers (wake lock).
+        // apply them.
         let mut events = Vec::new();
         let mut disconnected = false;
         if let Some(handle) = &self.server.handle {
@@ -517,8 +542,6 @@ impl TovekApp {
             match event {
                 ServerEvent::Running(addr) => {
                     self.server.state = ServerState::Running(addr);
-                    #[cfg(target_os = "android")]
-                    self.on_server_running();
                 }
                 ServerEvent::Stopped => {
                     self.server.state = ServerState::Stopped;
@@ -538,11 +561,45 @@ impl TovekApp {
         }
         if drop_handle {
             self.server.handle = None;
-            #[cfg(target_os = "android")]
-            self.release_wake_lock();
         }
         if matches!(self.server.state, ServerState::Starting) {
             busy = true;
+        }
+
+        // Android: the server runs in the :tovek_server service process, so
+        // the UI can only observe it from the outside — probe the port about
+        // once a second while anything server-related is (or should be) up.
+        #[cfg(target_os = "android")]
+        {
+            let due = self
+                .server
+                .last_probe
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(1000));
+            if due {
+                self.server.last_probe = Some(std::time::Instant::now());
+                let up = jobs::probe_port(self.server.port);
+                self.server.state = match (&self.server.state, up) {
+                    (_, true) => {
+                        self.server.started_at = None;
+                        ServerState::Running(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            self.server.port,
+                        )))
+                    }
+                    (ServerState::Starting, false) => {
+                        if self.server.started_at.is_some_and(|t| t.elapsed() < Duration::from_secs(15)) {
+                            ServerState::Starting
+                        } else {
+                            ServerState::Failed(
+                                "the keep-alive service did not come up — check logcat".into(),
+                            )
+                        }
+                    }
+                    (ServerState::Failed(error), false) => ServerState::Failed(error.clone()),
+                    (_, false) => ServerState::Stopped,
+                };
+            }
+            ctx.request_repaint_after(Duration::from_millis(1100));
         }
 
         if busy {
@@ -550,21 +607,17 @@ impl TovekApp {
         }
     }
 
-    #[cfg(target_os = "android")]
-    fn on_server_running(&mut self) {
-        if self.server.hold_wake_lock && self.server.wake_lock.is_none() {
-            match crate::android::acquire_wake_lock() {
-                Ok(lock) => self.server.wake_lock = Some(lock),
-                Err(error) => log::warn!("wake lock: {error}"),
-            }
+    /// The `host:port` an executor must POST to: the LAN address when the
+    /// server is reachable from other devices (always the case on Android,
+    /// where executors cannot resolve the app's localhost), plain localhost
+    /// otherwise.
+    fn executor_host(&self) -> String {
+        if self.server.bind_all
+            && let Some(ip) = self.server.lan_ip
+        {
+            return format!("{ip}:{}", self.server.port);
         }
-    }
-
-    #[cfg(target_os = "android")]
-    fn release_wake_lock(&mut self) {
-        if let Some(mut lock) = self.server.wake_lock.take() {
-            lock.release();
-        }
+        format!("localhost:{}", self.server.port)
     }
 
     // -----------------------------------------------------------------------
@@ -938,6 +991,12 @@ impl TovekApp {
         ui.weak("The same HTTP server as the standalone `web-server` binary — point an executor client script at it and dump a whole game.");
         ui.add_space(4.0);
 
+        #[cfg(target_os = "android")]
+        let running = matches!(
+            self.server.state,
+            ServerState::Running(_) | ServerState::Starting
+        );
+        #[cfg(not(target_os = "android"))]
         let running = self.server.handle.is_some();
         ui.horizontal_wrapped(|ui| {
             ui.label("Port:");
@@ -953,20 +1012,52 @@ impl TovekApp {
                 !running,
                 egui::Checkbox::new(&mut self.server.bind_all, "Listen on all interfaces (LAN)"),
             )
-            .on_hover_text("Bind 0.0.0.0 so another device (e.g. a phone executor pointing at this PC) can reach the server. Only use on trusted networks.");
+            .on_hover_text("Bind 0.0.0.0 so another device can reach the server — required on Android, where executors must use the phone's LAN address, never localhost. Only use on trusted networks.");
         });
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if running {
-                if ui.button("⏹ Stop server").clicked()
-                    && let Some(handle) = &mut self.server.handle
-                {
-                    handle.stop();
+                if ui.button("⏹ Stop server").clicked() {
+                    #[cfg(target_os = "android")]
+                    {
+                        match crate::android::stop_server_service() {
+                            Ok(()) => self.server.state = ServerState::Stopped,
+                            Err(error) => self.toast = Some(format!("stop service: {error}")),
+                        }
+                        self.server.started_at = None;
+                        self.server.last_probe = None;
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    if let Some(handle) = &mut self.server.handle {
+                        handle.stop();
+                    }
                 }
             } else if ui.button("▶ Start server").clicked() {
                 self.server.state = ServerState::Starting;
-                self.server.handle = Some(jobs::start_server(self.server.port, self.server.bind_all));
+                self.server.lan_ip = jobs::lan_ip();
+                #[cfg(target_os = "android")]
+                {
+                    if !self.server.notifications_requested {
+                        self.server.notifications_requested = true;
+                        if let Err(error) = crate::android::request_post_notifications() {
+                            log::warn!("POST_NOTIFICATIONS request: {error}");
+                        }
+                    }
+                    self.server.started_at = Some(std::time::Instant::now());
+                    self.server.last_probe = None;
+                    if let Err(error) = crate::android::start_server_service(
+                        self.server.port,
+                        self.server.bind_all,
+                    ) {
+                        self.server.state = ServerState::Failed(error);
+                    }
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    self.server.handle =
+                        Some(jobs::start_server(self.server.port, self.server.bind_all));
+                }
             }
             match &self.server.state {
                 ServerState::Stopped => ui.weak("stopped"),
@@ -984,11 +1075,28 @@ impl TovekApp {
             };
         });
 
+        let host = self.executor_host();
         ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Executor URL:");
+            ui.monospace(format!("http://{host}"));
+            if ui
+                .small_button("↻")
+                .on_hover_text("Re-detect this device's LAN address")
+                .clicked()
+            {
+                self.server.lan_ip = jobs::lan_ip();
+            }
+        });
+        if self.server.bind_all && self.server.lan_ip.is_none() {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                "No LAN address detected — is WiFi connected?",
+            );
+        }
         ui.label("Routes (identical to the standalone server):");
         ui.monospace(format!(
-            "POST http://localhost:{0}/decompile        one script, base64 body\nPOST http://localhost:{0}/decompile/raw    one script, raw bytecode body\nPOST http://localhost:{0}/decompile/batch  many scripts, JSON or MDB1",
-            self.server.port
+            "POST http://{host}/decompile        one script, base64 body\nPOST http://{host}/decompile/raw    one script, raw bytecode body\nPOST http://{host}/decompile/batch  many scripts, JSON or MDB1",
         ));
         ui.weak("Per-request options: X-Encode-Key header, and X-Flags (names like `dont_reuse_var,strict_no_synthetic_control` or the numeric bit mask) — every decompile option is reachable over HTTP too.");
 
@@ -1004,42 +1112,26 @@ impl TovekApp {
                     crate::android::keep_screen_on(app, self.server.keep_screen_on);
                 }
             }
-            if ui
-                .checkbox(
-                    &mut self.server.hold_wake_lock,
-                    "Hold a partial wake lock while the server runs",
-                )
-                .changed()
-            {
-                if self.server.hold_wake_lock {
-                    if matches!(self.server.state, ServerState::Running(_)) {
-                        self.on_server_running();
-                    }
-                } else {
-                    self.release_wake_lock();
-                }
-            }
-            let lock_state = if self.server.wake_lock.is_some() {
-                "wake lock held"
-            } else {
-                "wake lock not held"
-            };
-            ui.weak(format!(
-                "{lock_state} — keep Tovek in the foreground (or split-screen with the executor) while dumping; Android may freeze fully backgrounded apps."
-            ));
+            ui.weak(
+                "The server runs in its own foreground service (persistent notification, \
+                 wake + WiFi locks) — it keeps listening even after this app is swiped away, \
+                 like Termux. Stop it with the button above or the notification's Stop action.",
+            );
         }
 
         ui.separator();
-        ui.label("Executor client scripts (host scripts), retargeted at this port:");
+        ui.label(format!(
+            "Executor client scripts (host scripts), retargeted at http://{host}:"
+        ));
         ui.horizontal_wrapped(|ui| {
             if ui.button("📋 Copy single-script client").clicked() {
                 ui.ctx()
-                    .copy_text(scripts::single_client_for_port(self.server.port));
+                    .copy_text(scripts::single_client_for_host(&host));
                 self.toast = Some("decompile.client.luau copied".into());
             }
             if ui.button("📋 Copy batch client").clicked() {
                 ui.ctx()
-                    .copy_text(scripts::batch_client_for_port(self.server.port));
+                    .copy_text(scripts::batch_client_for_host(&host));
                 self.toast = Some("decompile-batch.client.luau copied".into());
             }
             if ui.button("💾 Save both…").clicked() {
@@ -1053,22 +1145,23 @@ impl TovekApp {
     }
 
     fn scripts_tab_ui(&mut self, ui: &mut egui::Ui) {
+        let host = self.executor_host();
         ui.heading("Luau host scripts");
-        ui.weak("The executor-side clients that drive the server — one for each decompile transport. They are embedded in this app (and shipped next to every release binary), already retargeted at the configured server port.");
+        ui.weak("The executor-side clients that drive the server — one for each decompile transport. They are embedded in this app (and shipped next to every release binary), already retargeted at the address the executor must use.");
         ui.add_space(4.0);
-        ui.label(format!("Current server port: {}", self.server.port));
+        ui.label(format!("Current server address: http://{host}"));
 
         for (title, description, body, show) in [
             (
                 "decompile.client.luau — single-script transport",
                 "Installs getgenv().decompile and POSTs each script's bytecode (base64) to /decompile while SynSaveInstance walks the game.",
-                scripts::single_client_for_port(self.server.port),
+                scripts::single_client_for_host(&host),
                 &mut self.scripts.show_single,
             ),
             (
                 "decompile-batch.client.luau — batch + raw transport",
                 "Pre-walks every script, ships whole chunks to /decompile/batch (binary MDB1 framing or base64 JSON), answers SynSaveInstance from the cache, falls back to single POSTs on misses.",
-                scripts::batch_client_for_port(self.server.port),
+                scripts::batch_client_for_host(&host),
                 &mut self.scripts.show_batch,
             ),
         ] {
@@ -1177,10 +1270,10 @@ impl eframe::App for TovekApp {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 match &self.server.state {
-                    ServerState::Running(addr) => {
+                    ServerState::Running(_) => {
                         ui.colored_label(
                             egui::Color32::LIGHT_GREEN,
-                            format!("● server http://{addr}"),
+                            format!("● server http://{}", self.executor_host()),
                         );
                     }
                     ServerState::Starting => {

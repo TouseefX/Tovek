@@ -12,9 +12,12 @@
 //!     with copy/save for each.
 //!
 //! On Android the app is built as a NativeActivity cdylib with xbuild (see
-//! `manifest.yaml`); while the server runs it holds `FLAG_KEEP_SCREEN_ON` and a
-//! partial wake lock so an on-device executor can keep streaming bytecode to it
-//! as long as the app stays in the foreground.
+//! `manifest.yaml`). The embedded server does not run in the UI process
+//! there: `TovekService` (a foreground service in its own `:tovek_server`
+//! process, injected into the APK by CI) loads this same library and drives
+//! the server through the `nativeStartServer`/`nativeStopServer` exports
+//! below — so the server keeps listening even after the app is swiped away,
+//! Termux-style, until Stop is pressed in the app or on the notification.
 
 // Same allocator as the CLI/server binaries: the decompiler is allocation-bound
 // and mimalloc's per-thread free-lists measurably cut wall time. This crate is
@@ -115,4 +118,60 @@ fn android_main(android_app: winit::platform::android::activity::AndroidApp) {
         }),
     )
     .expect("failed to start the Tovek GUI");
+}
+
+/// JNI entry points for `TovekService` (tovek-gui/android/TovekService.java).
+///
+/// The service runs in its own `:tovek_server` process: it loads this library
+/// with `System.loadLibrary` and starts/stops the embedded axum server here.
+/// No `ndk_context` exists in that process (there is no activity), so these
+/// functions must not touch the `android` module — plain Rust only.
+#[cfg(target_os = "android")]
+mod service_jni {
+    use std::sync::Mutex;
+
+    use jni::JNIEnv;
+    use jni::objects::JClass;
+    use jni::sys::{jboolean, jint};
+
+    static SERVER: Mutex<Option<crate::jobs::ServerHandle>> = Mutex::new(None);
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_dev_tovek_gui_TovekService_nativeStartServer(
+        _env: JNIEnv,
+        _class: JClass,
+        port: jint,
+        bind_all: jboolean,
+    ) {
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Info)
+                .with_tag("tovek-server"),
+        );
+        crate::init_decompiler();
+        let port = port as u16;
+        let bind_all = bind_all != 0;
+        let mut slot = SERVER.lock().expect("server slot poisoned");
+        if let Some(handle) = slot.as_ref() {
+            if handle.port == port && handle.bind_all == bind_all {
+                log::info!("server already running on port {port}");
+                return;
+            }
+            // Parameters changed: stop the old server before starting anew.
+            slot.take();
+        }
+        log::info!("starting server on port {port} (bind_all={bind_all})");
+        *slot = Some(crate::jobs::start_server(port, bind_all));
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_dev_tovek_gui_TovekService_nativeStopServer(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        if let Some(mut handle) = SERVER.lock().expect("server slot poisoned").take() {
+            log::info!("stopping server");
+            handle.stop();
+        }
+    }
 }

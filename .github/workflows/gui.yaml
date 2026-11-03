@@ -28,6 +28,9 @@ env:
   # xbuild pinned for reproducible APK builds (master, 2025-08-15).
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
   NDK_VERSION: r27c
+  # apktool is used to inject the keep-alive foreground service (classes.dex +
+  # <service> manifest entry) into the xbuild APK; xbuild can't compile Java.
+  APKTOOL_VERSION: 2.11.1
   CARGO_TERM_COLOR: never
 
 jobs:
@@ -175,11 +178,49 @@ jobs:
         working-directory: tovek-gui
         run: x build --release --platform android --arch arm64 --format apk
 
+      # ----------------------------------------------------------------------
+      # Termux-style keep-alive: TovekService is a Java foreground service in
+      # its own :tovek_server process that loads libtovek_gui.so and runs the
+      # decompiler server, so it survives the app being swiped away. xbuild
+      # cannot compile Java or declare <service> elements, so the class is
+      # compiled here (javac + d8) and injected into the APK with apktool.
+      # ----------------------------------------------------------------------
+      - name: Compile the keep-alive service to classes.dex
+        run: |
+          set -euo pipefail
+          AJAR="$ANDROID_HOME/platforms/android-34/android.jar"
+          if [ ! -f "$AJAR" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-34" >/dev/null
+          fi
+          test -f "$AJAR"
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          mkdir -p service-build/classes service-build/dex
+          javac -source 8 -target 8 -nowarn -bootclasspath "$AJAR" \
+            -d service-build/classes tovek-gui/android/TovekService.java
+          "$BUILD_TOOLS/d8" --release --min-api 26 --lib "$AJAR" \
+            --output service-build/dex \
+            service-build/classes/dev/tovek/gui/*.class
+          test -f service-build/dex/classes.dex
+
+      - name: Inject the service into the APK
+        run: |
+          set -euo pipefail
+          APK="$(find tovek-gui/target/x -maxdepth 4 -name '*.apk' | head -n 1)"
+          test -n "$APK" || { echo "xbuild produced no APK"; find tovek-gui/target/x -maxdepth 4 -type f | head; exit 1; }
+          curl -sSfL -o "$RUNNER_TEMP/apktool.jar" \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          java -jar "$RUNNER_TEMP/apktool.jar" d -s -f -o service-build/apk "$APK"
+          python3 scripts/patch_android_manifest.py service-build/apk/AndroidManifest.xml
+          cp service-build/dex/classes.dex service-build/apk/classes.dex
+          java -jar "$RUNNER_TEMP/apktool.jar" b -o service-build/tovek-gui-unsigned.apk service-build/apk
+          # The rebuilt APK must carry the dex with TovekService:
+          unzip -l service-build/tovek-gui-unsigned.apk | grep -F classes.dex
+
       - name: Zipalign + sign the APK
         run: |
           set -euo pipefail
-          UNSIGNED="$(find tovek-gui/target/x -maxdepth 4 -name '*.apk' | head -n 1)"
-          test -n "$UNSIGNED" || { echo "xbuild produced no APK"; find tovek-gui/target/x -maxdepth 4 -type f | head; exit 1; }
+          UNSIGNED="service-build/tovek-gui-unsigned.apk"
+          test -f "$UNSIGNED"
           echo "Unsigned APK: $UNSIGNED"
 
           BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"

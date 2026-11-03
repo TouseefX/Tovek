@@ -17,21 +17,23 @@ pub const BATCH_CLIENT: &str = include_str!("../../decompile-batch.client.luau")
 
 const DEFAULT_ORIGIN: &str = "http://localhost:3000";
 
-/// The single-script client, retargeted at the port the embedded server uses.
-pub fn single_client_for_port(port: u16) -> String {
-    retarget(SINGLE_CLIENT, port)
+/// The single-script client, retargeted at `host` (e.g. `192.168.1.7:3000`
+/// on Android, where executors cannot reach `localhost`, or
+/// `localhost:<port>` on desktop).
+pub fn single_client_for_host(host: &str) -> String {
+    retarget(SINGLE_CLIENT, host)
 }
 
-/// The batch/RAW client, retargeted at the port the embedded server uses.
-pub fn batch_client_for_port(port: u16) -> String {
-    retarget(BATCH_CLIENT, port)
+/// The batch/RAW client, retargeted at `host` (see [`single_client_for_host`]).
+pub fn batch_client_for_host(host: &str) -> String {
+    retarget(BATCH_CLIENT, host)
 }
 
-fn retarget(script: &str, port: u16) -> String {
-    if port == 3000 {
+fn retarget(script: &str, host: &str) -> String {
+    if host == "localhost:3000" {
         return script.to_owned();
     }
-    script.replace(DEFAULT_ORIGIN, &format!("http://localhost:{port}"))
+    script.replace(DEFAULT_ORIGIN, &format!("http://{host}"))
 }
 
 #[cfg(test)]
@@ -46,11 +48,16 @@ mod tests {
 
     #[test]
     fn retargeting_rewrites_every_url() {
-        let single = single_client_for_port(4123);
-        let batch = batch_client_for_port(4123);
+        let single = single_client_for_host("localhost:4123");
+        let batch = batch_client_for_host("192.168.1.7:3000");
         assert!(!single.contains(DEFAULT_ORIGIN));
         assert!(!batch.contains(DEFAULT_ORIGIN));
         assert!(single.contains("http://localhost:4123/decompile"));
-        assert!(batch.contains("http://localhost:4123"));
+        assert!(batch.contains("http://192.168.1.7:3000"));
+    }
+
+    #[test]
+    fn default_host_is_untouched() {
+        assert_eq!(single_client_for_host("localhost:3000"), SINGLE_CLIENT);
     }
 }

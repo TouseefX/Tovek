@@ -1,22 +1,22 @@
-//! Android foreground/keep-alive support, via JNI against the NativeActivity.
+//! Android foreground/keep-alive support.
 //!
-//! Two mechanisms, both best-effort (errors are reported, never fatal):
-//!   * `FLAG_KEEP_SCREEN_ON` on the activity window — the screen stays awake
-//!     while the user leaves the app in the foreground.
-//!   * a `PARTIAL_WAKE_LOCK` from `PowerManager`, held while the embedded
-//!     decompiler server runs, so the CPU keeps serving an on-device executor
-//!     even if the screen dims (requires `android.permission.WAKE_LOCK`,
-//!     declared in manifest.yaml).
-//!
-//! Note: without a Java foreground *service* the OS may still freeze the
-//! process once the app leaves the foreground entirely; the supported workflow
-//! is to keep Tovek in the foreground (or split-screen) while dumping.
+//! The embedded server does NOT run inside the UI process on Android: swiping
+//! the app away kills that process no matter what locks it holds. Instead the
+//! server runs inside `TovekService` (tovek-gui/android/TovekService.java), a
+//! foreground service in its own `:tovek_server` process which loads this
+//! same native library and drives it through the `nativeStartServer` /
+//! `nativeStopServer` JNI exports in `lib.rs`. The service holds a partial
+//! wake lock + WiFi lock and shows a persistent notification with a Stop
+//! action — Termux-style. This module is the UI-process side: it fires the
+//! start/stop intents, requests the notification permission, and handles the
+//! screen/keyboard niceties.
 
 use jni::JavaVM;
-use jni::objects::{GlobalRef, JObject, JValue};
+use jni::objects::{JObject, JValue};
 use winit::platform::android::activity::{AndroidApp, WindowManagerFlags};
 
-const PARTIAL_WAKE_LOCK: i32 = 0x0000_0001;
+const SERVICE_CLASS: &str = "dev.tovek.gui.TovekService";
+const ACTION_STOP: &str = "dev.tovek.gui.action.STOP";
 
 /// Run `f` with an attached JNI env + the NativeActivity object.
 fn with_activity<T>(
@@ -73,66 +73,117 @@ pub fn keep_screen_on(app: &AndroidApp, on: bool) {
     }
 }
 
-/// A held `PowerManager.WakeLock`; released on [`WakeLock::release`] or drop.
-pub struct WakeLock {
-    lock: GlobalRef,
-    released: bool,
+/// Build an Intent targeting `TovekService` (loaded through the activity's
+/// class loader — `FindClass` from a native thread cannot see app classes).
+fn service_intent<'a>(
+    env: &mut jni::JNIEnv<'a>,
+    activity: &JObject,
+) -> jni::errors::Result<JObject<'a>> {
+    let name = env.new_string(SERVICE_CLASS)?;
+    let loader = env
+        .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+        .l()?;
+    let class = env
+        .call_method(
+            &loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&name)],
+        )?
+        .l()?;
+    env.new_object(
+        "android/content/Intent",
+        "(Landroid/content/Context;Ljava/lang/Class;)V",
+        &[JValue::Object(activity), JValue::Object(&class)],
+    )
 }
 
-/// Acquire a partial wake lock named `tovek:server`.
-pub fn acquire_wake_lock() -> Result<WakeLock, String> {
-    let lock = with_activity(|env, activity| {
-        let service_name = env.new_string("power")?;
-        let power_manager = env
-            .call_method(
-                activity,
-                "getSystemService",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-                &[JValue::Object(&service_name)],
-            )?
-            .l()?;
-        let tag = env.new_string("tovek:server")?;
-        let wake_lock = env
-            .call_method(
-                &power_manager,
-                "newWakeLock",
-                "(ILjava/lang/String;)Landroid/os/PowerManager$WakeLock;",
-                &[JValue::Int(PARTIAL_WAKE_LOCK), JValue::Object(&tag)],
-            )?
-            .l()?;
-        // One acquire()/release() pair regardless of how often we toggle.
-        env.call_method(&wake_lock, "setReferenceCounted", "(Z)V", &[JValue::Bool(0)])?;
-        env.call_method(&wake_lock, "acquire", "()V", &[])?;
-        env.new_global_ref(wake_lock)
-    })?;
-    Ok(WakeLock {
-        lock,
-        released: false,
+/// Start the foreground service that hosts the decompiler server.
+pub fn start_server_service(port: u16, bind_all: bool) -> Result<(), String> {
+    with_activity(|env, activity| {
+        let intent = service_intent(env, activity)?;
+        let key_port = env.new_string("port")?;
+        env.call_method(
+            &intent,
+            "putExtra",
+            "(Ljava/lang/String;I)Landroid/content/Intent;",
+            &[JValue::Object(&key_port), JValue::Int(i32::from(port))],
+        )?;
+        let key_bind = env.new_string("bind_all")?;
+        env.call_method(
+            &intent,
+            "putExtra",
+            "(Ljava/lang/String;Z)Landroid/content/Intent;",
+            &[JValue::Object(&key_bind), JValue::Bool(u8::from(bind_all))],
+        )?;
+        env.call_method(
+            activity,
+            "startForegroundService",
+            "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+            &[JValue::Object(&intent)],
+        )?;
+        Ok(())
     })
 }
 
-impl WakeLock {
-    pub fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        let _ = with_activity(|env, _| {
-            env.call_method(self.lock.as_obj(), "release", "()V", &[])?;
-            Ok(())
-        });
-    }
+/// Ask the service to stop the server, drop its notification and exit.
+pub fn stop_server_service() -> Result<(), String> {
+    with_activity(|env, activity| {
+        let intent = service_intent(env, activity)?;
+        let action = env.new_string(ACTION_STOP)?;
+        env.call_method(
+            &intent,
+            "setAction",
+            "(Ljava/lang/String;)Landroid/content/Intent;",
+            &[JValue::Object(&action)],
+        )?;
+        env.call_method(
+            activity,
+            "startService",
+            "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+            &[JValue::Object(&intent)],
+        )?;
+        Ok(())
+    })
 }
 
-impl Drop for WakeLock {
-    fn drop(&mut self) {
-        self.release();
-    }
+/// Request `POST_NOTIFICATIONS` (API 33+) so the foreground service's
+/// notification is visible. The service runs either way — this only controls
+/// whether the user can see (and stop) it from the shade.
+pub fn request_post_notifications() -> Result<(), String> {
+    with_activity(|env, activity| {
+        let sdk = env
+            .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?
+            .i()?;
+        if sdk < 33 {
+            return Ok(());
+        }
+        let permission = env.new_string("android.permission.POST_NOTIFICATIONS")?;
+        let granted = env
+            .call_method(
+                activity,
+                "checkSelfPermission",
+                "(Ljava/lang/String;)I",
+                &[JValue::Object(&permission)],
+            )?
+            .i()?;
+        if granted == 0 {
+            return Ok(()); // PERMISSION_GRANTED
+        }
+        let array = env.new_object_array(1, "java/lang/String", &permission)?;
+        env.call_method(
+            activity,
+            "requestPermissions",
+            "([Ljava/lang/String;I)V",
+            &[JValue::Object(&array), JValue::Int(0)],
+        )?;
+        Ok(())
+    })
 }
 
 /// Show or hide the soft keyboard (NativeActivity never raises it on its own,
 /// so text fields get a manual toggle in the top bar).
-pub fn show_soft_input(app: &winit::platform::android::activity::AndroidApp, show: bool) {
+pub fn show_soft_input(app: &AndroidApp, show: bool) {
     if show {
         app.show_soft_input(true);
     } else {
