@@ -131,17 +131,26 @@ mod service_jni {
     use std::sync::Mutex;
 
     use jni::JNIEnv;
-    use jni::objects::JClass;
+    use jni::objects::{JClass, JString};
     use jni::sys::{jboolean, jint};
 
     static SERVER: Mutex<Option<crate::jobs::ServerHandle>> = Mutex::new(None);
 
+    fn optional_string(env: &mut JNIEnv, value: &JString) -> Option<String> {
+        if value.as_raw().is_null() {
+            return None;
+        }
+        env.get_string(value).ok().map(String::from)
+    }
+
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_dev_tovek_gui_TovekService_nativeStartServer(
-        _env: JNIEnv,
+        mut env: JNIEnv,
         _class: JClass,
         port: jint,
         bind_all: jboolean,
+        cert_path: JString,
+        key_path: JString,
     ) {
         android_logger::init_once(
             android_logger::Config::default()
@@ -151,6 +160,13 @@ mod service_jni {
         crate::init_decompiler();
         let port = port as u16;
         let bind_all = bind_all != 0;
+        let tls = match (
+            optional_string(&mut env, &cert_path),
+            optional_string(&mut env, &key_path),
+        ) {
+            (Some(cert), Some(key)) => Some((cert.into(), key.into())),
+            _ => None,
+        };
         let mut slot = SERVER.lock().expect("server slot poisoned");
         if let Some(handle) = slot.as_ref() {
             if handle.port == port && handle.bind_all == bind_all {
@@ -160,8 +176,8 @@ mod service_jni {
             // Parameters changed: stop the old server before starting anew.
             slot.take();
         }
-        log::info!("starting server on port {port} (bind_all={bind_all})");
-        *slot = Some(crate::jobs::start_server(port, bind_all));
+        log::info!("starting server on port {port} (bind_all={bind_all}, tls={})", tls.is_some());
+        *slot = Some(crate::jobs::start_server(port, bind_all, tls));
     }
 
     #[unsafe(no_mangle)]

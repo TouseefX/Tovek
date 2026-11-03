@@ -5,13 +5,17 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.drawable.Icon;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 
 /**
@@ -33,6 +37,8 @@ public final class TovekService extends Service {
     public static final String ACTION_STOP = "dev.tovek.gui.action.STOP";
     public static final String EXTRA_PORT = "port";
     public static final String EXTRA_BIND_ALL = "bind_all";
+    public static final String EXTRA_CERT_PATH = "cert_path";
+    public static final String EXTRA_KEY_PATH = "key_path";
 
     private static final String CHANNEL_ID = "tovek_server";
     private static final int NOTIFICATION_ID = 1;
@@ -41,9 +47,28 @@ public final class TovekService extends Service {
         System.loadLibrary("tovek_gui");
     }
 
-    private static native void nativeStartServer(int port, boolean bindAll);
+    private static native void nativeStartServer(
+            int port, boolean bindAll, String certPath, String keyPath);
 
     private static native void nativeStopServer();
+
+    /**
+     * Clipboard helper for the UI process: eframe's clipboard backend has no
+     * Android support, so the Rust side calls this instead. ClipboardManager
+     * must be used from a Looper thread, hence the main-looper post.
+     */
+    public static void copyToClipboard(final Context context, final String text) {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                ClipboardManager cm =
+                        (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm != null) {
+                    cm.setPrimaryClip(ClipData.newPlainText("Tovek", text));
+                }
+            }
+        });
+    }
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
@@ -61,10 +86,14 @@ public final class TovekService extends Service {
         }
         int port = intent != null ? intent.getIntExtra(EXTRA_PORT, 3000) : 3000;
         boolean bindAll = intent == null || intent.getBooleanExtra(EXTRA_BIND_ALL, true);
+        String certPath = intent != null ? intent.getStringExtra(EXTRA_CERT_PATH) : null;
+        String keyPath = intent != null ? intent.getStringExtra(EXTRA_KEY_PATH) : null;
+        boolean https = certPath != null && keyPath != null;
 
-        startForegroundWithNotification("Server listening on port " + port);
+        startForegroundWithNotification(
+                "Server listening on port " + port + (https ? " (https)" : " (http)"));
         acquireLocks();
-        nativeStartServer(port, bindAll);
+        nativeStartServer(port, bindAll, certPath, keyPath);
         return START_STICKY;
     }
 

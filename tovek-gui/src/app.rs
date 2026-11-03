@@ -228,6 +228,8 @@ enum PickTarget {
     ValidateAnalyze,
     ValidateToolDir,
     ScriptsDir,
+    TlsCert,
+    TlsKey,
 }
 
 struct SingleTab {
@@ -268,6 +270,21 @@ enum ServerState {
     Failed(String),
 }
 
+/// How the embedded server terminates TLS.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TlsSetting {
+    /// Plain HTTP.
+    Off,
+    /// Auto-generated self-signed certificate — only works with executors
+    /// that skip TLS verification.
+    SelfSigned,
+    /// User-supplied PEM cert + key. The route to a cert executors can
+    /// VERIFY: a CA-signed cert for a domain resolving to this device
+    /// (magic DNS like traefik.me / local-ip.co publish wildcard certs+keys,
+    /// or use your own domain). No CA signs bare private-IP certs.
+    Custom,
+}
+
 struct ServerTab {
     port: u16,
     bind_all: bool,
@@ -275,6 +292,15 @@ struct ServerTab {
     state: ServerState,
     /// Cached LAN address for executor-facing URLs (refreshable in the UI).
     lan_ip: Option<std::net::IpAddr>,
+    /// TLS mode for the next start.
+    tls: TlsSetting,
+    /// PEM paths for [`TlsSetting::Custom`].
+    cert_path: String,
+    key_path: String,
+    /// Optional override for the host executors should use (e.g. a magic-DNS
+    /// name like `192-168-1-7.traefik.me` whose CA-signed cert is loaded in
+    /// Custom mode). Empty = auto (LAN IP / localhost).
+    advertised_host: String,
     #[cfg(target_os = "android")]
     keep_screen_on: bool,
     /// Last time the UI probed 127.0.0.1:port for the service-hosted server.
@@ -378,6 +404,10 @@ impl TovekApp {
                 #[cfg(not(target_os = "android"))]
                 state: ServerState::Stopped,
                 lan_ip: jobs::lan_ip(),
+                tls: TlsSetting::Off,
+                cert_path: String::new(),
+                key_path: String::new(),
+                advertised_host: String::new(),
                 #[cfg(target_os = "android")]
                 keep_screen_on: true,
                 #[cfg(target_os = "android")]
@@ -419,6 +449,8 @@ impl TovekApp {
             PickTarget::ValidateAnalyze => self.folder.analyze_path = text,
             PickTarget::ValidateToolDir => self.folder.tool_dir = text,
             PickTarget::ScriptsDir => self.save_client_scripts(&path),
+            PickTarget::TlsCert => self.server.cert_path = text,
+            PickTarget::TlsKey => self.server.key_path = text,
         }
     }
 
@@ -441,15 +473,15 @@ impl TovekApp {
     }
 
     fn save_client_scripts(&mut self, dir: &Path) {
-        let host = self.executor_host();
+        let origin = self.executor_origin();
         let files = [
             (
                 "decompile.client.luau",
-                scripts::single_client_for_host(&host),
+                scripts::single_client_for_origin(&origin),
             ),
             (
                 "decompile-batch.client.luau",
-                scripts::batch_client_for_host(&host),
+                scripts::batch_client_for_origin(&origin),
             ),
         ];
         let mut saved = Vec::new();
@@ -607,17 +639,64 @@ impl TovekApp {
         }
     }
 
-    /// The `host:port` an executor must POST to: the LAN address when the
-    /// server is reachable from other devices (always the case on Android,
-    /// where executors cannot resolve the app's localhost), plain localhost
-    /// otherwise.
+    /// The `host:port` an executor must POST to: the advertised host when
+    /// set (e.g. a magic-DNS name matching a verified cert), otherwise the
+    /// LAN address when the server is reachable from other devices (always
+    /// the case on Android, where executors cannot resolve the app's
+    /// localhost), plain localhost otherwise.
     fn executor_host(&self) -> String {
+        let advertised = self.server.advertised_host.trim();
+        if !advertised.is_empty() {
+            return if advertised.contains(':') {
+                advertised.to_owned()
+            } else {
+                format!("{advertised}:{}", self.server.port)
+            };
+        }
         if self.server.bind_all
             && let Some(ip) = self.server.lan_ip
         {
             return format!("{ip}:{}", self.server.port);
         }
         format!("localhost:{}", self.server.port)
+    }
+
+    /// Full scheme + host executors must use (what the client scripts are
+    /// retargeted at).
+    fn executor_origin(&self) -> String {
+        let scheme = if matches!(self.server.tls, TlsSetting::Off) {
+            "http"
+        } else {
+            "https"
+        };
+        format!("{scheme}://{}", self.executor_host())
+    }
+
+    /// Resolve the PEM pair for the configured TLS mode (`None` = plain HTTP).
+    fn tls_paths(&self) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        match self.server.tls {
+            TlsSetting::Off => Ok(None),
+            TlsSetting::SelfSigned => {
+                let mut sans = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
+                if let Some(ip) = self.server.lan_ip {
+                    sans.push(ip.to_string());
+                }
+                let advertised = self.server.advertised_host.trim();
+                if !advertised.is_empty() {
+                    let host = advertised.split(':').next().unwrap_or(advertised);
+                    sans.push(host.to_owned());
+                }
+                jobs::ensure_self_signed(&self.default_dir, &sans).map(Some)
+            }
+            TlsSetting::Custom => {
+                let cert = self.server.cert_path.trim();
+                let key = self.server.key_path.trim();
+                if cert.is_empty() || key.is_empty() {
+                    return Err("pick both the certificate and the private key (PEM)".into());
+                }
+                Ok(Some((PathBuf::from(cert), PathBuf::from(key))))
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1016,6 +1095,63 @@ impl TovekApp {
         });
 
         ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("HTTPS:");
+            ui.add_enabled_ui(!running, |ui| {
+                ui.selectable_value(&mut self.server.tls, TlsSetting::Off, "Off");
+                ui.selectable_value(&mut self.server.tls, TlsSetting::SelfSigned, "Self-signed")
+                    .on_hover_text("Auto-generated certificate. Works only with executors that skip TLS verification.");
+                ui.selectable_value(&mut self.server.tls, TlsSetting::Custom, "Custom cert")
+                    .on_hover_text("Your own PEM certificate + key — the way to a cert executors can actually verify.");
+            });
+        });
+        match self.server.tls {
+            TlsSetting::SelfSigned => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Self-signed: executors must have TLS verification disabled.");
+                    if ui.small_button("Regenerate").on_hover_text("Delete the stored certificate so the next start makes a fresh one (do this after the LAN address changes)").clicked() {
+                        jobs::forget_self_signed(&self.default_dir);
+                        self.toast = Some("Certificate will be regenerated on next start".into());
+                    }
+                });
+            }
+            TlsSetting::Custom => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Cert (PEM):");
+                    ui.add(egui::TextEdit::singleline(&mut self.server.cert_path).desired_width(260.0));
+                    if ui.button("📂").clicked() {
+                        let hint = self.default_dir.display().to_string();
+                        self.open_picker(PickTarget::TlsCert, PickKind::File, "Pick the certificate (fullchain PEM)", &hint);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Key (PEM):");
+                    ui.add(egui::TextEdit::singleline(&mut self.server.key_path).desired_width(260.0));
+                    if ui.button("📂").clicked() {
+                        let hint = self.default_dir.display().to_string();
+                        self.open_picker(PickTarget::TlsKey, PickKind::File, "Pick the private key (PEM)", &hint);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Advertised host:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.server.advertised_host)
+                            .hint_text("e.g. 192-168-1-7.traefik.me")
+                            .desired_width(260.0),
+                    )
+                    .on_hover_text("The hostname the certificate was issued for; scripts and URLs use it instead of the raw IP.");
+                });
+                ui.weak(
+                    "For a VERIFIED cert on a LAN device: no CA signs private-IP certs, so use a \
+                     magic-DNS domain that resolves to this device's IP and its published \
+                     CA-signed wildcard cert (e.g. traefik.me or local-ip.co — download their \
+                     cert+key PEMs and pick them above), or a cert for your own domain.",
+                );
+            }
+            TlsSetting::Off => {}
+        }
+
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             if running {
                 if ui.button("⏹ Stop server").clicked() {
@@ -1034,29 +1170,45 @@ impl TovekApp {
                     }
                 }
             } else if ui.button("▶ Start server").clicked() {
-                self.server.state = ServerState::Starting;
                 self.server.lan_ip = jobs::lan_ip();
-                #[cfg(target_os = "android")]
-                {
-                    if !self.server.notifications_requested {
-                        self.server.notifications_requested = true;
-                        if let Err(error) = crate::android::request_post_notifications() {
-                            log::warn!("POST_NOTIFICATIONS request: {error}");
-                        }
-                    }
-                    self.server.started_at = Some(std::time::Instant::now());
-                    self.server.last_probe = None;
-                    if let Err(error) = crate::android::start_server_service(
-                        self.server.port,
-                        self.server.bind_all,
-                    ) {
+                match self.tls_paths() {
+                    Err(error) => {
                         self.server.state = ServerState::Failed(error);
                     }
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    self.server.handle =
-                        Some(jobs::start_server(self.server.port, self.server.bind_all));
+                    Ok(tls) => {
+                        self.server.state = ServerState::Starting;
+                        #[cfg(target_os = "android")]
+                        {
+                            if !self.server.notifications_requested {
+                                self.server.notifications_requested = true;
+                                if let Err(error) = crate::android::request_post_notifications() {
+                                    log::warn!("POST_NOTIFICATIONS request: {error}");
+                                }
+                            }
+                            self.server.started_at = Some(std::time::Instant::now());
+                            self.server.last_probe = None;
+                            let tls_strings = tls.as_ref().map(|(cert, key)| {
+                                (cert.display().to_string(), key.display().to_string())
+                            });
+                            if let Err(error) = crate::android::start_server_service(
+                                self.server.port,
+                                self.server.bind_all,
+                                tls_strings
+                                    .as_ref()
+                                    .map(|(cert, key)| (cert.as_str(), key.as_str())),
+                            ) {
+                                self.server.state = ServerState::Failed(error);
+                            }
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            self.server.handle = Some(jobs::start_server(
+                                self.server.port,
+                                self.server.bind_all,
+                                tls,
+                            ));
+                        }
+                    }
                 }
             }
             match &self.server.state {
@@ -1075,11 +1227,11 @@ impl TovekApp {
             };
         });
 
-        let host = self.executor_host();
+        let origin = self.executor_origin();
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             ui.label("Executor URL:");
-            ui.monospace(format!("http://{host}"));
+            ui.monospace(origin.clone());
             if ui
                 .small_button("↻")
                 .on_hover_text("Re-detect this device's LAN address")
@@ -1096,7 +1248,7 @@ impl TovekApp {
         }
         ui.label("Routes (identical to the standalone server):");
         ui.monospace(format!(
-            "POST http://{host}/decompile        one script, base64 body\nPOST http://{host}/decompile/raw    one script, raw bytecode body\nPOST http://{host}/decompile/batch  many scripts, JSON or MDB1",
+            "POST {origin}/decompile        one script, base64 body\nPOST {origin}/decompile/raw    one script, raw bytecode body\nPOST {origin}/decompile/batch  many scripts, JSON or MDB1",
         ));
         ui.weak("Per-request options: X-Encode-Key header, and X-Flags (names like `dont_reuse_var,strict_no_synthetic_control` or the numeric bit mask) — every decompile option is reachable over HTTP too.");
 
@@ -1121,17 +1273,17 @@ impl TovekApp {
 
         ui.separator();
         ui.label(format!(
-            "Executor client scripts (host scripts), retargeted at http://{host}:"
+            "Executor client scripts (host scripts), retargeted at {origin}:"
         ));
         ui.horizontal_wrapped(|ui| {
             if ui.button("📋 Copy single-script client").clicked() {
                 ui.ctx()
-                    .copy_text(scripts::single_client_for_host(&host));
+                    .copy_text(scripts::single_client_for_origin(&origin));
                 self.toast = Some("decompile.client.luau copied".into());
             }
             if ui.button("📋 Copy batch client").clicked() {
                 ui.ctx()
-                    .copy_text(scripts::batch_client_for_host(&host));
+                    .copy_text(scripts::batch_client_for_origin(&origin));
                 self.toast = Some("decompile-batch.client.luau copied".into());
             }
             if ui.button("💾 Save both…").clicked() {
@@ -1145,23 +1297,23 @@ impl TovekApp {
     }
 
     fn scripts_tab_ui(&mut self, ui: &mut egui::Ui) {
-        let host = self.executor_host();
+        let origin = self.executor_origin();
         ui.heading("Luau host scripts");
         ui.weak("The executor-side clients that drive the server — one for each decompile transport. They are embedded in this app (and shipped next to every release binary), already retargeted at the address the executor must use.");
         ui.add_space(4.0);
-        ui.label(format!("Current server address: http://{host}"));
+        ui.label(format!("Current server address: {origin}"));
 
         for (title, description, body, show) in [
             (
                 "decompile.client.luau — single-script transport",
                 "Installs getgenv().decompile and POSTs each script's bytecode (base64) to /decompile while SynSaveInstance walks the game.",
-                scripts::single_client_for_host(&host),
+                scripts::single_client_for_origin(&origin),
                 &mut self.scripts.show_single,
             ),
             (
                 "decompile-batch.client.luau — batch + raw transport",
                 "Pre-walks every script, ships whole chunks to /decompile/batch (binary MDB1 framing or base64 JSON), answers SynSaveInstance from the cache, falls back to single POSTs on misses.",
-                scripts::batch_client_for_host(&host),
+                scripts::batch_client_for_origin(&origin),
                 &mut self.scripts.show_batch,
             ),
         ] {
@@ -1273,7 +1425,7 @@ impl eframe::App for TovekApp {
                     ServerState::Running(_) => {
                         ui.colored_label(
                             egui::Color32::LIGHT_GREEN,
-                            format!("● server http://{}", self.executor_host()),
+                            format!("● server {}", self.executor_origin()),
                         );
                     }
                     ServerState::Starting => {
@@ -1320,6 +1472,30 @@ impl eframe::App for TovekApp {
                 self.picker = None;
                 if let Some(path) = picked {
                     self.apply_pick(target, path);
+                }
+            }
+        }
+
+        // eframe's clipboard backend (arboard) has no Android support — every
+        // egui copy command would silently vanish. Intercept them here and
+        // route through the Java ClipboardManager instead. This covers every
+        // 📋 button in the app.
+        #[cfg(target_os = "android")]
+        {
+            let mut copied: Option<String> = None;
+            ctx.output_mut(|out| {
+                out.commands.retain(|command| match command {
+                    egui::OutputCommand::CopyText(text) => {
+                        copied = Some(text.clone());
+                        false
+                    }
+                    _ => true,
+                });
+            });
+            if let Some(text) = copied {
+                match crate::android::copy_to_clipboard(&text) {
+                    Ok(()) => self.toast = Some("Copied to clipboard".into()),
+                    Err(error) => self.toast = Some(format!("copy failed: {error}")),
                 }
             }
         }

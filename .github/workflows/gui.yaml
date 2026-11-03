@@ -176,7 +176,17 @@ jobs:
 
       - name: Build the APK with xbuild
         working-directory: tovek-gui
-        run: x build --release --platform android --arch arm64 --format apk
+        # ring (rustls' crypto backend, for the HTTPS server) compiles C with
+        # the `cc` crate, which needs to be pointed at the NDK clang for
+        # cross-compilation — the unversioned `aarch64-linux-android-clang`
+        # the cc crate guesses does not exist in modern NDKs.
+        run: |
+          set -euo pipefail
+          TOOLBIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$TOOLBIN/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$TOOLBIN/llvm-ar"
+          export CFLAGS_aarch64_linux_android="--target=aarch64-linux-android26"
+          x build --release --platform android --arch arm64 --format apk
 
       # ----------------------------------------------------------------------
       # Termux-style keep-alive: TovekService is a Java foreground service in

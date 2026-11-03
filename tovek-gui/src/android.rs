@@ -99,7 +99,13 @@ fn service_intent<'a>(
 }
 
 /// Start the foreground service that hosts the decompiler server.
-pub fn start_server_service(port: u16, bind_all: bool) -> Result<(), String> {
+/// `tls` carries `(cert_path, key_path)` PEM files for HTTPS, or `None` for
+/// plain HTTP.
+pub fn start_server_service(
+    port: u16,
+    bind_all: bool,
+    tls: Option<(&str, &str)>,
+) -> Result<(), String> {
     with_activity(|env, activity| {
         let intent = service_intent(env, activity)?;
         let key_port = env.new_string("port")?;
@@ -116,11 +122,60 @@ pub fn start_server_service(port: u16, bind_all: bool) -> Result<(), String> {
             "(Ljava/lang/String;Z)Landroid/content/Intent;",
             &[JValue::Object(&key_bind), JValue::Bool(u8::from(bind_all))],
         )?;
+        if let Some((cert, key)) = tls {
+            let key_cert = env.new_string("cert_path")?;
+            let cert_value = env.new_string(cert)?;
+            env.call_method(
+                &intent,
+                "putExtra",
+                "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                &[JValue::Object(&key_cert), JValue::Object(&cert_value)],
+            )?;
+            let key_key = env.new_string("key_path")?;
+            let key_value = env.new_string(key)?;
+            env.call_method(
+                &intent,
+                "putExtra",
+                "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                &[JValue::Object(&key_key), JValue::Object(&key_value)],
+            )?;
+        }
         env.call_method(
             activity,
             "startForegroundService",
             "(Landroid/content/Intent;)Landroid/content/ComponentName;",
             &[JValue::Object(&intent)],
+        )?;
+        Ok(())
+    })
+}
+
+/// Put `text` on the system clipboard.
+///
+/// eframe's clipboard backend (arboard) has no Android support, so egui's
+/// copy commands silently vanish there. This routes them through the
+/// `TovekService.copyToClipboard` Java helper, which posts to the main
+/// looper (ClipboardManager must be used from a Looper thread).
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    with_activity(|env, activity| {
+        let name = env.new_string(SERVICE_CLASS)?;
+        let loader = env
+            .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let class = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        let jtext = env.new_string(text)?;
+        env.call_static_method(
+            jni::objects::JClass::from(class),
+            "copyToClipboard",
+            "(Landroid/content/Context;Ljava/lang/String;)V",
+            &[JValue::Object(activity), JValue::Object(&jtext)],
         )?;
         Ok(())
     })

@@ -48,6 +48,15 @@ web-server = { path = "../web-server" }
 axum = "0.7"
 tokio = { version = "1.42", features = ["rt-multi-thread", "sync", "time"] }
 
+# HTTPS for the embedded server (Roblox/executors may refuse cleartext HTTP).
+# rustls with the *ring* backend on every platform: the default aws-lc-rs
+# backend needs cmake/NASM and does not cross-compile to Android with xbuild.
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Self-signed certificate generation (for executors that skip verification;
+# verified setups point the Custom mode at a CA-signed cert instead).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+
 # Used by the folder pipeline modules compiled in from
 # luau-lifter/src/{decompile_core,decompile_cache,batch}.rs — the GUI's
 # "Decompile folder" is source-identical with the CLI's `decompile-folder`.

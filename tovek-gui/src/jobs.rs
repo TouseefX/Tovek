@@ -303,7 +303,49 @@ impl Drop for ServerHandle {
     }
 }
 
-pub fn start_server(port: u16, bind_all: bool) -> ServerHandle {
+/// Install rustls' ring crypto provider exactly once per process (required
+/// before any `RustlsConfig` is built; the default provider is aws-lc, which
+/// this build does not carry).
+fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Create (or reuse) a self-signed certificate under `dir`, returning
+/// `(cert_path, key_path)`. `sans` are the DNS/IP subject alternative names
+/// the certificate should cover. Executors that verify TLS will NOT accept
+/// this — it exists for clients that allow self-signed; verified setups use
+/// a CA-signed cert via the Custom mode instead.
+pub fn ensure_self_signed(dir: &Path, sans: &[String]) -> Result<(PathBuf, PathBuf), String> {
+    let cert_path = dir.join("tovek-self-signed.crt");
+    let key_path = dir.join("tovek-self-signed.key");
+    if cert_path.exists() && key_path.exists() {
+        return Ok((cert_path, key_path));
+    }
+    let certified = rcgen::generate_simple_self_signed(sans.to_vec())
+        .map_err(|error| format!("generate certificate: {error}"))?;
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    std::fs::write(&cert_path, certified.cert.pem())
+        .map_err(|error| format!("write {}: {error}", cert_path.display()))?;
+    std::fs::write(&key_path, certified.key_pair.serialize_pem())
+        .map_err(|error| format!("write {}: {error}", key_path.display()))?;
+    Ok((cert_path, key_path))
+}
+
+/// Delete a previously generated self-signed pair so the next start
+/// regenerates it (e.g. after the LAN address changed).
+pub fn forget_self_signed(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("tovek-self-signed.crt"));
+    let _ = std::fs::remove_file(dir.join("tovek-self-signed.key"));
+}
+
+pub fn start_server(
+    port: u16,
+    bind_all: bool,
+    tls: Option<(PathBuf, PathBuf)>,
+) -> ServerHandle {
     let (tx, rx) = channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let result = std::thread::Builder::new()
@@ -330,6 +372,51 @@ pub fn start_server(port: u16, bind_all: bool) -> ServerHandle {
                 };
                 let host = if bind_all { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
                 let addr = SocketAddr::from((host, port));
+
+                if let Some((cert, key)) = tls {
+                    // HTTPS: axum-server's rustls acceptor over the same router.
+                    install_crypto_provider();
+                    let config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                        &cert, &key,
+                    )
+                    .await
+                    {
+                        Ok(config) => config,
+                        Err(error) => {
+                            let _ = tx.send(ServerEvent::Failed(format!(
+                                "load TLS cert/key: {error}"
+                            )));
+                            return;
+                        }
+                    };
+                    let handle = axum_server::Handle::new();
+                    {
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            let _ = shutdown_rx.await;
+                            handle.graceful_shutdown(Some(Duration::from_secs(3)));
+                        });
+                    }
+                    {
+                        let handle = handle.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            if let Some(local) = handle.listening().await {
+                                let _ = tx.send(ServerEvent::Running(local));
+                            }
+                        });
+                    }
+                    let served = axum_server::bind_rustls(addr, config)
+                        .handle(handle)
+                        .serve(router.into_make_service())
+                        .await;
+                    let _ = tx.send(match served {
+                        Ok(()) => ServerEvent::Stopped,
+                        Err(error) => ServerEvent::Failed(error.to_string()),
+                    });
+                    return;
+                }
+
                 let listener = match tokio::net::TcpListener::bind(addr).await {
                     Ok(listener) => listener,
                     Err(error) => {
