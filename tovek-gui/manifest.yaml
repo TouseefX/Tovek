@@ -1,0 +1,52 @@
+# ============================================================================
+# xbuild (https://github.com/rust-mobile/xbuild) project manifest
+# ----------------------------------------------------------------------------
+# Build locally with:
+#   x build --release --platform android --arch arm64 --format apk
+#
+# Pure NativeActivity app (eframe's `android-native-activity` backend), so no
+# Gradle/Kotlin is needed: xbuild's built-in APK writer packages libtovek_gui.so
+# directly. CI (.github/workflows/gui.yaml) symlinks a real NDK sysroot into
+# ~/.cache/x/Android.ndk because xbuild's bundled 2022 sysroot has no API-34
+# stubs, then zipaligns (16 KB pages) and signs the result.
+# ============================================================================
+
+android:
+  manifest:
+    package: "dev.tovek.gui"
+    version_name: "2.7.0"
+    version_code: 2700
+
+    sdk:
+      # 26+: modern storage semantics and a NativeActivity surface that eframe's
+      # winit backend handles well. target 34 keeps Play-era devices happy; the
+      # NDK sysroot wired up in CI provides the API-34 stubs xbuild compiles
+      # against.
+      min_sdk_version: 26
+      target_sdk_version: 34
+
+    uses_permission:
+      # The embedded decompiler server (127.0.0.1:<port>) and the executor
+      # client that posts bytecode to it.
+      - name: "android.permission.INTERNET"
+      - name: "android.permission.ACCESS_NETWORK_STATE"
+      # Foreground/keep-alive support: the app holds a partial wake lock (and
+      # FLAG_KEEP_SCREEN_ON) while the server runs so an on-device executor can
+      # keep streaming scripts to it.
+      - name: "android.permission.WAKE_LOCK"
+      - name: "android.permission.FOREGROUND_SERVICE"
+      - name: "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+      # Reading bytecode dumps from shared storage and writing decompiled
+      # trees back. Legacy permissions for older devices, MANAGE_EXTERNAL_STORAGE
+      # ("All files access", granted manually in system settings) for 30+.
+      - name: "android.permission.READ_EXTERNAL_STORAGE"
+        max_sdk_version: 32
+      - name: "android.permission.WRITE_EXTERNAL_STORAGE"
+        max_sdk_version: 29
+      - name: "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+    application:
+      label: "Tovek"
+      # Pure NativeActivity: no Java/Kotlin code in the APK.
+      # (xbuild appends android.app.lib_name + the MAIN/LAUNCHER intent filter
+      # to its default activity automatically.)

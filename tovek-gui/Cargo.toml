@@ -1,0 +1,91 @@
+# ============================================================================
+# Tovek GUI — one egui app for Windows, Linux, macOS and Android.
+#
+# Desktop: `cargo build --release` in this directory (binary `tovek-gui`).
+# Android: `x build --release --platform android --arch arm64 --format apk`
+#          in this directory (xbuild; see manifest.yaml and
+#          .github/workflows/gui.yaml for the full recipe).
+# ============================================================================
+
+[package]
+name = "tovek-gui"
+version = "2.7.0"
+edition = "2024"
+authors = ["Tovek contributors"]
+description = "GUI for the Tovek Luau decompiler: single-file, folder and embedded HTTP server modes on desktop and Android"
+publish = false
+
+# Detached from the repository's root workspace on purpose: the GUI pulls
+# large UI dependencies (eframe/winit/glow/android glue) that must not
+# disturb the root Cargo.lock used by the `--locked` release builds.
+[workspace]
+
+[lib]
+name = "tovek_gui"
+# cdylib is what the Android APK loads (xbuild), rlib is for the desktop bin.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "tovek-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned exactly: the eframe/winit Android story moves between minor versions
+# and this one is the release this app was written and CI-tested against.
+eframe = { version = "=0.32.3", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+
+# The decompiler itself, plus the embedded HTTP server (same axum router as
+# the standalone `web-server` binary — see web-server/src/lib.rs).
+luau-lifter = { path = "../luau-lifter" }
+web-server = { path = "../web-server" }
+axum = "0.7"
+tokio = { version = "1.42", features = ["rt-multi-thread", "sync", "time"] }
+
+# Used by the folder pipeline modules compiled in from
+# luau-lifter/src/{decompile_core,decompile_cache,batch}.rs — the GUI's
+# "Decompile folder" is source-identical with the CLI's `decompile-folder`.
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+rayon = "1.5.3"
+rustc-hash = "1.1.0"
+walkdir = "2.3.2"
+parking_lot = "0.12.1"
+fs2 = "0.4.3"
+
+log = "0.4"
+
+# Same allocator story as the CLI/server binaries: the decompiler is
+# allocation-bound and mimalloc's per-thread free-lists cut wall time
+# noticeably. Lives in this leaf crate (the app), never in the shared library.
+mimalloc = "0.1.52"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Adds the NativeActivity glue on Android only (feature union with the
+# dependency above; wayland/x11 are inert off Linux).
+eframe = { version = "=0.32.3", default-features = false, features = [
+    "android-native-activity",
+] }
+winit = "0.30"
+android_logger = "0.14"
+# Foreground/keep-alive support: FLAG_KEEP_SCREEN_ON + a partial wake lock
+# through JNI while the embedded server runs.
+jni = "0.21"
+ndk-context = "0.1"
+
+[profile.release]
+opt-level = 3
+# Thin LTO: close to fat-LTO speed at a fraction of the link time/memory —
+# this workspace builds on 2–4 core CI runners for five targets.
+lto = "thin"
+codegen-units = 16
+# Drop DWARF but keep the symbol table so Android logcat backtraces and
+# desktop crash reports still resolve to function names.
+debug = false
+strip = "debuginfo"

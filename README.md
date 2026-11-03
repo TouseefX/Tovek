@@ -9,6 +9,8 @@
 
 Builds are published for Windows x86_64, Linux x86_64, Linux aarch64 and macOS on Apple silicon. Each package holds the two programs, `luau-lifter` (CLI) and `web-server` (local HTTP server), plus the licence; the executor client scripts live in this repository. The release tag is `v2.7`; Rust package versions are `2.7.0`.
 
+**GUI:** [`tovek-gui/`](tovek-gui/) is a cross-platform GUI (Windows, Linux, macOS **and Android**) bundling the single-file decompiler, the CLI-identical folder drivers, the embedded HTTP server and both executor client scripts. Desktop builds use plain cargo; the Android APK is built with [xbuild](https://github.com/rust-mobile/xbuild) (`.github/workflows/gui.yaml` produces all five artifacts, each packaged with the Luau host scripts).
+
 [**💬 Join the Tovek Discord →**](https://discord.gg/phY6VUDSF7)
 
 Tovek is a fork of the [medal](https://github.com/Stefanuk12/medal-decompiler) Luau

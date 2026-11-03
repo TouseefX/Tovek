@@ -1,0 +1,234 @@
+name: GUI (desktop + Android)
+
+# The GUI lives in its own detached cargo workspace (tovek-gui/), so these
+# builds never touch the root Cargo.lock used by the `--locked` CLI releases.
+#
+# Jobs:
+#   * refactor-check — the root workspace still builds `--locked` after the
+#     web-server lib/bin split the GUI embeds.
+#   * desktop        — Windows x86_64, Linux x86_64/aarch64, macOS aarch64.
+#   * android        — arm64 APK via xbuild (NativeActivity, no Gradle),
+#     zipaligned (16 KB pages) and signed.
+# Every artifact is packaged together with BOTH Luau host scripts
+# (decompile.client.luau + decompile-batch.client.luau) by
+# scripts/package_gui.py.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['arena/**']
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN: nightly-2026-06-15
+  # xbuild pinned for reproducible APK builds (master, 2025-08-15).
+  XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
+  NDK_VERSION: r27c
+  CARGO_TERM_COLOR: never
+
+jobs:
+  refactor-check:
+    name: Root workspace still locked (web-server tests)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui-refactor-check
+      # --locked proves the lib/bin split added no dependencies: the release
+      # workflow's `--locked` builds keep working untouched.
+      - name: Test the refactored web-server (lib + bin)
+        run: cargo +nightly-2026-06-15 test --locked -p web-server
+      - name: Build the web-server binary
+        run: cargo +nightly-2026-06-15 build --locked -p web-server
+
+  desktop:
+    name: Desktop ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            platform: macos-aarch64
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'tovek-gui -> target'
+          key: gui-${{ matrix.target }}
+      - name: Install Linux windowing dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libxext-dev libgl1-mesa-dev libegl1-mesa-dev
+      - name: Link the Windows runtime statically
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"RUSTFLAGS=-C target-feature=+crt-static" >> $env:GITHUB_ENV'
+      - name: Build the GUI
+        working-directory: tovek-gui
+        run: cargo +nightly-2026-06-15 build --release --target ${{ matrix.target }}
+      - name: Package with the Luau host scripts
+        run: >
+          python3 scripts/package_gui.py --platform ${{ matrix.platform }}
+          --bin-dir tovek-gui/target/${{ matrix.target }}/release --out dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: tovek-gui-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  android:
+    name: Android arm64 APK (xbuild)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      # xbuild always compiles against $XDG_CACHE_HOME/x/Android.ndk. By
+      # default it downloads a 2022-era sysroot from its own GitHub release,
+      # which has no API-34 stubs ("ndk doesn't support sdk version 34").
+      # Point it at the real NDK sysroot instead and put the NDK's
+      # clang/llvm-ar/lld first on PATH, since that is what xbuild invokes.
+      - name: Wire xbuild up to the real NDK
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -d "$SYSROOT/usr/lib/aarch64-linux-android/34"
+          mkdir -p "$HOME/.cache/x"
+          rm -rf "$HOME/.cache/x/Android.ndk"
+          ln -s "$SYSROOT" "$HOME/.cache/x/Android.ndk"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+
+      - name: Install Rust ${{ env.TOOLCHAIN }} with the Android target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'tovek-gui -> target'
+          key: gui-android-arm64
+
+      - name: Cache the xbuild binary
+        id: cache-x
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/x
+          key: xbuild-${{ env.XBUILD_REV }}-${{ runner.os }}
+
+      - name: Install xbuild
+        if: steps.cache-x.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # Build the tool itself with stable (its dependency tree predates
+          # the pinned nightly); the app is still cross-compiled with nightly.
+          rustup toolchain install stable --profile minimal
+          cargo +stable install --locked --git https://github.com/rust-mobile/xbuild \
+            --rev "$XBUILD_REV" xbuild
+
+      - name: x doctor
+        run: x doctor || true
+
+      - name: Build the APK with xbuild
+        working-directory: tovek-gui
+        run: x build --release --platform android --arch arm64 --format apk
+
+      - name: Zipalign + sign the APK
+        run: |
+          set -euo pipefail
+          UNSIGNED="$(find tovek-gui/target/x -maxdepth 4 -name '*.apk' | head -n 1)"
+          test -n "$UNSIGNED" || { echo "xbuild produced no APK"; find tovek-gui/target/x -maxdepth 4 -type f | head; exit 1; }
+          echo "Unsigned APK: $UNSIGNED"
+
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          echo "Using build-tools: $BUILD_TOOLS"
+
+          KEYSTORE="$RUNNER_TEMP/tovek-release.jks"
+          keytool -genkeypair -v \
+            -keystore "$KEYSTORE" \
+            -storepass android -keypass android \
+            -alias tovek -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Tovek, O=Tovek, C=US" >/dev/null 2>&1
+
+          mkdir -p signed
+          # -P 16: 16 KB page alignment, required for Android 15+ devices.
+          "$BUILD_TOOLS/zipalign" -f -P 16 4 "$UNSIGNED" signed/aligned.apk \
+            || "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" signed/aligned.apk
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+            --ks-key-alias tovek \
+            --out signed/tovek-gui.apk signed/aligned.apk
+          rm -f signed/aligned.apk signed/aligned.apk.idsig
+          "$BUILD_TOOLS/apksigner" verify --verbose signed/tovek-gui.apk
+          ls -lh signed/tovek-gui.apk
+
+      - name: Package with the Luau host scripts
+        run: >
+          python3 scripts/package_gui.py --platform android-arm64
+          --apk signed/tovek-gui.apk --out dist
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: tovek-gui-android-arm64
+          path: dist/*
+          if-no-files-found: error
+
+      # Keep the unstripped native library so crashes can be symbolised
+      # offline with ndk-stack / llvm-addr2line.
+      - name: Collect symbols
+        if: always()
+        run: |
+          SO="$(find tovek-gui/target/x -type f -name 'libtovek_gui.so' | head -n 1 || true)"
+          if [ -n "$SO" ]; then
+            mkdir -p symbols && cp "$SO" symbols/libtovek_gui.so && ls -lh symbols
+          else
+            echo "no .so found; skipping symbols artifact"
+          fi
+      - name: Upload symbols
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: tovek-gui-android-symbols
+          path: symbols/
+          if-no-files-found: ignore

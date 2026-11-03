@@ -10,6 +10,11 @@ members = [
     "luau-worker",
     "web-server",
 ]
+# The GUI is its own detached workspace (tovek-gui/Cargo.toml declares
+# `[workspace]`): it pulls large UI/windowing dependencies (eframe, winit,
+# glow, android glue) that must not disturb this root Cargo.lock — the
+# `--locked` release builds of the CLI and server stay byte-identical.
+exclude = ["tovek-gui"]
 
 [workspace.package]
 edition = "2024"
