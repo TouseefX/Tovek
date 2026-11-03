@@ -415,11 +415,18 @@ impl Drop for RunningJob {
 /// mimalloc keeps what a thread frees in that thread's heap for reuse, and an
 /// idle thread never gives it back: after a large batch the server would hold
 /// its peak memory while idle. Collect every decompile thread's heap.
+#[cfg(not(target_os = "android"))]
 fn release_freed_memory() {
     // SAFETY: mi_collect only frees memory no live allocation uses.
     rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
     unsafe { libmimalloc_sys::mi_collect(true) };
 }
+
+/// Android builds use the system allocator — mimalloc's initial-exec TLS
+/// cannot be dlopen()ed by Bionic (the GUI links this library into the
+/// NativeActivity cdylib) — so there is nothing to collect.
+#[cfg(target_os = "android")]
+fn release_freed_memory() {}
 
 // ---------------------------------------------------------------------------
 // Batch request parsing

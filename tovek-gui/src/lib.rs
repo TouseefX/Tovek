@@ -19,6 +19,13 @@
 // Same allocator as the CLI/server binaries: the decompiler is allocation-bound
 // and mimalloc's per-thread free-lists measurably cut wall time. This crate is
 // a leaf (app), so installing the global allocator here is safe.
+//
+// NOT on Android: libmimalloc-sys builds its C code with
+// `-ftls-model=initial-exec`, and Bionic's dynamic linker rejects IE-model TLS
+// in a dlopen()ed library — NativeActivity could not load libtovek_gui.so
+// ("TLS symbol \"(null)\" … using IE access model"). Android uses the system
+// allocator (scudo) instead.
+#[cfg(not(target_os = "android"))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

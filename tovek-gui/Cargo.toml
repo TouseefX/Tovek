@@ -66,6 +66,11 @@ log = "0.4"
 # Same allocator story as the CLI/server binaries: the decompiler is
 # allocation-bound and mimalloc's per-thread free-lists cut wall time
 # noticeably. Lives in this leaf crate (the app), never in the shared library.
+# NOT on Android: libmimalloc-sys compiles its C code with
+# `-ftls-model=initial-exec`, and Bionic rejects IE-model TLS in dlopen()ed
+# libraries — the APK died on startup with
+# `dlopen failed: TLS symbol "(null)" ... using IE access model`.
+[target.'cfg(not(target_os = "android"))'.dependencies]
 mimalloc = "0.1.52"
 
 [target.'cfg(target_os = "android")'.dependencies]
