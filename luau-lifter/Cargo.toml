@@ -37,8 +37,14 @@ sha2 = "0.10"
 # the wasm dependency graph entirely; the native binaries that use it
 # (`luau-lifter`) are never built for wasm.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-mimalloc = "0.1.52"
 fs2 = "0.4.3"
+
+# Additionally gated off Android: libmimalloc-sys compiles its C code with
+# `-ftls-model=initial-exec`, which Bionic's dynamic linker rejects inside a
+# dlopen()ed library (the GUI's NativeActivity cdylib links this crate). The
+# CLI binary that actually installs the allocator is never built for Android.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
+mimalloc = "0.1.52"
 
 [features]
 dhat-heap = []

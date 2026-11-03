@@ -16,9 +16,6 @@ luau-lifter = { path = "../luau-lifter" }
 # for the CLI binary, larger under the concurrent batch load), byte-identical
 # output. The allocator MUST live in the binary, not the library (the library is
 # shared with the wasm `luau-worker`, which can't build mimalloc's C source).
-mimalloc = "0.1.52"
-# mi_collect: an idle server returns what its decompile threads freed.
-libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 rayon = "1.5.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,3 +27,13 @@ tracing-subscriber = "0.3"
 [dev-dependencies]
 tokio = { version = "1.42", features = ["io-util", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
+
+# mimalloc is allocation-bound gold on desktop but must stay OUT of Android
+# builds: libmimalloc-sys compiles its C code with `-ftls-model=initial-exec`,
+# which Bionic rejects in dlopen()ed libraries (the GUI links this library into
+# the NativeActivity cdylib). The binary target is never built for Android, and
+# `release_freed_memory` is a no-op there.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+mimalloc = "0.1.52"
+# mi_collect: an idle server returns what its decompile threads freed.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
