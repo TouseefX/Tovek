@@ -341,6 +341,90 @@ pub fn forget_self_signed(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("tovek-self-signed.key"));
 }
 
+/// Minimal plain-HTTP GET (std only — the GUI carries no HTTP client).
+/// HTTP/1.0 on purpose: it forbids chunked transfer-encoding, so the body is
+/// simply everything after the header block. Raw sockets also bypass
+/// Android's cleartext-traffic policy (which only governs the Java stack).
+fn http_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let addr = (host, 80u16)
+        .to_socket_addrs()
+        .map_err(|error| format!("resolve {host}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("resolve {host}: no address"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))
+        .map_err(|error| format!("connect {host}: {error}"))?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: tovek-gui\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .map_err(|error| format!("send request: {error}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("read response: {error}"))?;
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("malformed HTTP response")?;
+    let status_line = String::from_utf8_lossy(
+        &response[..response
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(header_end)],
+    )
+    .into_owned();
+    if !status_line.contains(" 200") {
+        return Err(format!("GET http://{host}{path}: {status_line}"));
+    }
+    Ok(response[header_end + 4..].to_vec())
+}
+
+/// Download local-ip.co's published wildcard certificate (CA-signed for
+/// `*.my.local-ip.co`) and private key into `dir`, writing a fullchain PEM
+/// (leaf + intermediate — rustls must serve the chain or clients can't
+/// verify). Returns `(cert_path, key_path)`. Let's Encrypt rotates the cert,
+/// so re-fetch when it expires (~every 90 days).
+pub fn fetch_local_ip_cert(dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let server = http_get("local-ip.co", "/cert/server.pem")?;
+    let chain = http_get("local-ip.co", "/cert/chain.pem")?;
+    let key = http_get("local-ip.co", "/cert/server.key")?;
+    if !server.starts_with(b"-----BEGIN") || !chain.starts_with(b"-----BEGIN") {
+        return Err("local-ip.co returned something that is not a PEM certificate".into());
+    }
+    if !key.starts_with(b"-----BEGIN") {
+        return Err("local-ip.co returned something that is not a PEM key".into());
+    }
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let cert_path = dir.join("local-ip-fullchain.pem");
+    let key_path = dir.join("local-ip.key");
+    let mut fullchain = server;
+    if fullchain.last() != Some(&b'\n') {
+        fullchain.push(b'\n');
+    }
+    fullchain.extend_from_slice(&chain);
+    std::fs::write(&cert_path, fullchain)
+        .map_err(|error| format!("write {}: {error}", cert_path.display()))?;
+    std::fs::write(&key_path, key)
+        .map_err(|error| format!("write {}: {error}", key_path.display()))?;
+    Ok((cert_path, key_path))
+}
+
+/// The `*.my.local-ip.co` hostname that resolves to `ip` (dash-encoded).
+pub fn local_ip_host(ip: std::net::IpAddr) -> Option<String> {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            Some(format!("{}.my.local-ip.co", v4.to_string().replace('.', "-")))
+        }
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
 pub fn start_server(
     port: u16,
     bind_all: bool,

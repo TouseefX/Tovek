@@ -298,9 +298,11 @@ struct ServerTab {
     cert_path: String,
     key_path: String,
     /// Optional override for the host executors should use (e.g. a magic-DNS
-    /// name like `192-168-1-7.traefik.me` whose CA-signed cert is loaded in
-    /// Custom mode). Empty = auto (LAN IP / localhost).
+    /// name like `192-168-1-7.my.local-ip.co` whose CA-signed cert is loaded
+    /// in Custom mode). Empty = auto (LAN IP / localhost).
     advertised_host: String,
+    /// In-flight local-ip.co certificate download.
+    cert_fetch: Option<Receiver<Result<(PathBuf, PathBuf), String>>>,
     #[cfg(target_os = "android")]
     keep_screen_on: bool,
     /// Last time the UI probed 127.0.0.1:port for the service-hosted server.
@@ -408,6 +410,7 @@ impl TovekApp {
                 cert_path: String::new(),
                 key_path: String::new(),
                 advertised_host: String::new(),
+                cert_fetch: None,
                 #[cfg(target_os = "android")]
                 keep_screen_on: true,
                 #[cfg(target_os = "android")]
@@ -596,6 +599,34 @@ impl TovekApp {
         }
         if matches!(self.server.state, ServerState::Starting) {
             busy = true;
+        }
+
+        // local-ip.co certificate download finishing?
+        if let Some(rx) = &self.server.cert_fetch {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.server.cert_fetch = None;
+                    match result {
+                        Ok((cert, key)) => {
+                            self.server.cert_path = cert.display().to_string();
+                            self.server.key_path = key.display().to_string();
+                            if let Some(host) =
+                                self.server.lan_ip.and_then(jobs::local_ip_host)
+                            {
+                                self.server.advertised_host = host;
+                            }
+                            self.toast =
+                                Some("local-ip.co certificate installed (re-fetch when it expires)".into());
+                        }
+                        Err(error) => self.toast = Some(format!("local-ip.co fetch failed: {error}")),
+                    }
+                }
+                Err(TryRecvError::Empty) => busy = true,
+                Err(TryRecvError::Disconnected) => {
+                    self.server.cert_fetch = None;
+                    self.toast = Some("local-ip.co fetch failed: worker stopped".into());
+                }
+            }
         }
 
         // Android: the server runs in the :tovek_server service process, so
@@ -1117,6 +1148,26 @@ impl TovekApp {
             }
             TlsSetting::Custom => {
                 ui.horizontal_wrapped(|ui| {
+                    let fetching = self.server.cert_fetch.is_some();
+                    if ui
+                        .add_enabled(!fetching, egui::Button::new("⬇ Get local-ip.co cert"))
+                        .on_hover_text("Downloads local-ip.co's CA-signed wildcard certificate + key (they publish both), builds the fullchain PEM, and fills everything in — including the <your-ip>.my.local-ip.co hostname. Re-fetch when the cert expires (~90 days).")
+                        .clicked()
+                    {
+                        self.server.lan_ip = jobs::lan_ip();
+                        let dir = self.default_dir.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(jobs::fetch_local_ip_cert(&dir));
+                        });
+                        self.server.cert_fetch = Some(rx);
+                    }
+                    if fetching {
+                        ui.spinner();
+                        ui.weak("downloading…");
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Cert (PEM):");
                     ui.add(egui::TextEdit::singleline(&mut self.server.cert_path).desired_width(260.0));
                     if ui.button("📂").clicked() {
@@ -1143,9 +1194,10 @@ impl TovekApp {
                 });
                 ui.weak(
                     "For a VERIFIED cert on a LAN device: no CA signs private-IP certs, so use a \
-                     magic-DNS domain that resolves to this device's IP and its published \
-                     CA-signed wildcard cert (e.g. traefik.me or local-ip.co — download their \
-                     cert+key PEMs and pick them above), or a cert for your own domain.",
+                     magic-DNS domain that resolves to this device's IP with its published \
+                     CA-signed wildcard cert. The button above sets up local-ip.co \
+                     automatically; traefik.me or your own domain's cert work the same way \
+                     via the pickers.",
                 );
             }
             TlsSetting::Off => {}
