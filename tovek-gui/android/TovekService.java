@@ -9,6 +9,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.graphics.drawable.Icon;
 import android.net.wifi.WifiManager;
@@ -70,6 +71,7 @@ public final class TovekService extends Service {
         });
     }
 
+    private String lastNotificationText;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
 
@@ -84,14 +86,38 @@ public final class TovekService extends Service {
             shutdown();
             return START_NOT_STICKY;
         }
-        int port = intent != null ? intent.getIntExtra(EXTRA_PORT, 3000) : 3000;
-        boolean bindAll = intent == null || intent.getBooleanExtra(EXTRA_BIND_ALL, true);
-        String certPath = intent != null ? intent.getStringExtra(EXTRA_CERT_PATH) : null;
-        String keyPath = intent != null ? intent.getStringExtra(EXTRA_KEY_PATH) : null;
+
+        // START_STICKY restarts redeliver a *null* intent. Persist the last
+        // explicit configuration so a system restart brings the server back
+        // exactly as it was (same port AND same TLS mode — an http server on
+        // an https URL leaves executors hanging forever).
+        SharedPreferences prefs = getSharedPreferences("tovek_service", MODE_PRIVATE);
+        int port;
+        boolean bindAll;
+        String certPath;
+        String keyPath;
+        if (intent != null) {
+            port = intent.getIntExtra(EXTRA_PORT, 3000);
+            bindAll = intent.getBooleanExtra(EXTRA_BIND_ALL, true);
+            certPath = intent.getStringExtra(EXTRA_CERT_PATH);
+            keyPath = intent.getStringExtra(EXTRA_KEY_PATH);
+            prefs.edit()
+                    .putInt("port", port)
+                    .putBoolean("bind_all", bindAll)
+                    .putString("cert", certPath)
+                    .putString("key", keyPath)
+                    .apply();
+        } else {
+            port = prefs.getInt("port", 3000);
+            bindAll = prefs.getBoolean("bind_all", true);
+            certPath = prefs.getString("cert", null);
+            keyPath = prefs.getString("key", null);
+        }
         boolean https = certPath != null && keyPath != null;
 
-        startForegroundWithNotification(
-                "Server listening on port " + port + (https ? " (https)" : " (http)"));
+        lastNotificationText =
+                "Server listening on port " + port + (https ? " (https)" : " (http)");
+        startForegroundWithNotification(lastNotificationText);
         acquireLocks();
         nativeStartServer(port, bindAll, certPath, keyPath);
         return START_STICKY;
@@ -99,7 +125,11 @@ public final class TovekService extends Service {
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        // Deliberately empty: surviving the task swipe is the whole point.
+        // Surviving the task swipe is the whole point. Re-assert the
+        // foreground notification so the OS keeps treating us as foreground.
+        if (lastNotificationText != null) {
+            startForegroundWithNotification(lastNotificationText);
+        }
     }
 
     @Override

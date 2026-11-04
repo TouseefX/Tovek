@@ -41,6 +41,10 @@ android:
       # API 33+: makes the keep-alive notification (and its Stop action)
       # visible; the service runs either way.
       - name: "android.permission.POST_NOTIFICATIONS"
+      # Lets the app show the system "ignore battery optimizations" dialog —
+      # without the exemption most OEM ROMs kill even foreground services
+      # when the task is swiped away (same requirement as Termux).
+      - name: "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
       # Reading bytecode dumps from shared storage and writing decompiled
       # trees back. Legacy permissions for older devices, MANAGE_EXTERNAL_STORAGE
       # ("All files access", granted manually in system settings) for 30+.

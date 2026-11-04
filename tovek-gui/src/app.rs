@@ -311,9 +311,9 @@ struct ServerTab {
     /// When the start intent was fired (grace period before declaring failure).
     #[cfg(target_os = "android")]
     started_at: Option<std::time::Instant>,
-    /// POST_NOTIFICATIONS has been requested once this session.
+    /// Cached "is battery optimization disabled for us" answer.
     #[cfg(target_os = "android")]
-    notifications_requested: bool,
+    battery_exempt: Option<bool>,
 }
 
 struct ScriptsTab {
@@ -418,7 +418,7 @@ impl TovekApp {
                 #[cfg(target_os = "android")]
                 started_at: None,
                 #[cfg(target_os = "android")]
-                notifications_requested: false,
+                battery_exempt: crate::android::is_ignoring_battery_optimizations().ok(),
             },
             scripts: ScriptsTab {
                 show_single: false,
@@ -654,7 +654,9 @@ impl TovekApp {
                             ServerState::Starting
                         } else {
                             ServerState::Failed(
-                                "the keep-alive service did not come up — check logcat".into(),
+                                "the keep-alive service did not come up — disable battery \
+                                 optimization below, then check logcat"
+                                    .into(),
                             )
                         }
                     }
@@ -1231,12 +1233,6 @@ impl TovekApp {
                         self.server.state = ServerState::Starting;
                         #[cfg(target_os = "android")]
                         {
-                            if !self.server.notifications_requested {
-                                self.server.notifications_requested = true;
-                                if let Err(error) = crate::android::request_post_notifications() {
-                                    log::warn!("POST_NOTIFICATIONS request: {error}");
-                                }
-                            }
                             self.server.started_at = Some(std::time::Instant::now());
                             self.server.last_probe = None;
                             let tls_strings = tls.as_ref().map(|(cert, key)| {
@@ -1316,10 +1312,52 @@ impl TovekApp {
                     crate::android::keep_screen_on(app, self.server.keep_screen_on);
                 }
             }
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("🔔 Allow notification")
+                    .on_hover_text("Android 13+ hides the keep-alive notification (and its Stop button) until you grant notification permission. The server runs either way.")
+                    .clicked()
+                {
+                    if let Err(error) = crate::android::request_post_notifications() {
+                        self.toast = Some(format!("notification permission: {error}"));
+                    }
+                }
+                match self.server.battery_exempt {
+                    Some(true) => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_GREEN,
+                            "✓ battery optimization disabled",
+                        );
+                    }
+                    _ => {
+                        if ui
+                            .button("🔋 Disable battery optimization")
+                            .on_hover_text("REQUIRED for the server to survive swiping the app away on most devices — otherwise the OS kills the service. Same step Termux requires.")
+                            .clicked()
+                        {
+                            if let Err(error) =
+                                crate::android::request_ignore_battery_optimizations()
+                            {
+                                self.toast = Some(format!("battery exemption: {error}"));
+                            }
+                        }
+                    }
+                }
+                if ui
+                    .small_button("↻")
+                    .on_hover_text("Re-check the battery optimization status")
+                    .clicked()
+                {
+                    self.server.battery_exempt =
+                        crate::android::is_ignoring_battery_optimizations().ok();
+                }
+            });
             ui.weak(
                 "The server runs in its own foreground service (persistent notification, \
-                 wake + WiFi locks) — it keeps listening even after this app is swiped away, \
-                 like Termux. Stop it with the button above or the notification's Stop action.",
+                 wake + WiFi locks) and keeps listening after this app is swiped away, like \
+                 Termux — but ONLY if battery optimization is disabled above; aggressive ROMs \
+                 kill background services otherwise. Stop it with the button above or the \
+                 notification's Stop action.",
             );
         }
 
